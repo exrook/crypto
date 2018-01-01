@@ -1,0 +1,6 @@
+[package]
+name = "cryptocurrency"
+version = "0.1.0"
+authors = ["Jacob Hughes <j@jacobhughes.me>"]
+
+[dependencies]
