@@ -4,3 +4,7 @@ version = "0.1.0"
 authors = ["Jacob Hughes <j@jacobhughes.me>"]
 
 [dependencies]
+ring = "^0.12.1"
+blake2-rfc = "^0.2.18"
+untrusted = "^0.5.1"
+byteorder = "^1.2.1"
