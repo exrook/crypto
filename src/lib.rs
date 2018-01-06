@@ -1,16 +1,14 @@
 #![feature(i128_type, never_type)]
-extern crate blake2_rfc;
+extern crate blake2;
 extern crate byteorder;
-extern crate ring;
-extern crate untrusted;
+extern crate ed25519_dalek;
 
 use std::collections::{HashMap, HashSet};
 
-use ring::signature;
-use ring::signature::ED25519;
-use untrusted::Input;
-use blake2_rfc::blake2b::Blake2b;
-use byteorder::{ByteOrder, LE};
+use ed25519_dalek as ed25519;
+use blake2::{digest, Blake2b};
+use digest::{Input, VariableOutput};
+use byteorder::{ByteOrder, BE, LE};
 
 pub type Hash = [u8; 32];
 pub type PubKey = [u8; 32];
@@ -86,6 +84,17 @@ mod genesis {
         work: LIVE_WORK,
         signature: LIVE_SIGNATURE,
     };
+    #[test]
+    fn test_live_sig() {
+        LIVE_BLOCK.verify_sig().unwrap()
+    }
+    #[test]
+    fn test_live_work() {
+        use RaiWork;
+        let work: u64 = LIVE_BLOCK.work_validate().into();
+        println!("{:X}", work);
+        LIVE_BLOCK.verify_work().unwrap();
+    }
 
     const TEST_PRIVATE_KEY: [u8; 32] = [
         0x34, 0xF0, 0xA3, 0x7A, 0xAD, 0x20, 0xF4, 0xA2, 0x60, 0xF0, 0xA5, 0xB3, 0xCB, 0x3D, 0x7F,
@@ -117,6 +126,25 @@ mod genesis {
         work: TEST_WORK,
         signature: TEST_SIGNATURE,
     };
+    #[test]
+    fn test_test_key() {
+        use ed25519::*;
+        use blake2::Blake2b;
+        let priv_key = SecretKey::from_bytes(&TEST_PRIVATE_KEY).unwrap();
+        let derive_pub = PublicKey::from_secret::<Blake2b>(&priv_key);
+        assert_eq!(derive_pub.as_bytes(), &TEST_KEY);
+    }
+    #[test]
+    fn test_test_sig() {
+        TEST_BLOCK.verify_sig().unwrap()
+    }
+    #[test]
+    fn test_test_work() {
+        use RaiWork;
+        let work: u64 = TEST_BLOCK.work_validate().into();
+        println!("{:X}", work);
+        TEST_BLOCK.verify_work().unwrap();
+    }
 }
 
 pub trait RaiHash {
@@ -128,16 +156,13 @@ trait RaiHashImpl<'a> {
     #[inline]
     fn hash_elements(&'a self) -> Self::Elements;
     fn hash_impl(&'a self) -> Hash {
-        let mut hash = Blake2b::new(32);
+        let mut hash = Blake2b::new(32).unwrap();
         for e in self.hash_elements().as_ref() {
-            hash.update(e)
+            hash.process(e)
         }
-        let hash = hash.finalize();
-        let bytes = hash.as_bytes();
-        assert_eq!(bytes.len(), 32);
-        let mut out = Hash::default();
-        out.copy_from_slice(bytes);
-        out
+        let mut bytes = Hash::default();
+        hash.variable_result(&mut bytes).unwrap();
+        bytes
     }
 }
 
@@ -152,7 +177,8 @@ impl<T: for<'a> RaiHashImpl<'a>> RaiHash for T {
 pub trait RaiWork {
     fn verify_work(&self) -> Result<(), Failure> {
         let work: u64 = self.work_validate().into();
-        if work < WorkHash::RAI_WORK_THRESHOLD {
+        // TODO: Find out why this is right
+        if work > WorkHash::RAI_WORK_THRESHOLD {
             Ok(())
         } else {
             Err(Failure::Work)
@@ -166,15 +192,12 @@ trait RaiWorkImpl {
     fn work_element(&self) -> &[u8];
     fn work_value(&self) -> Work;
     fn work_impl(&self, work: Work) -> WorkHash {
-        let mut hash = Blake2b::new(8);
-        hash.update(work.as_ref());
-        hash.update(self.work_element());
-        let hash = hash.finalize();
-        let bytes = hash.as_bytes();
-        assert_eq!(bytes.len(), 8);
-        let mut out = <[u8; 8]>::default();
-        out.copy_from_slice(bytes);
-        WorkHash(out)
+        let mut hash = Blake2b::new(8).unwrap();
+        hash.process(work.as_ref());
+        hash.process(self.work_element());
+        let mut bytes = <[u8; 8]>::default();
+        hash.variable_result(&mut bytes).unwrap();
+        WorkHash(bytes)
     }
 }
 
@@ -246,12 +269,12 @@ impl OpenTransaction {
         }
     }
     fn verify_sig(&self) -> Result<(), Failure> {
-        signature::verify(
-            &ED25519,
-            Input::from(&self.account),
-            Input::from(&self.hash()),
-            Input::from(&self.signature),
-        ).map_err(|_| Failure::Signature)
+        let pubkey = ed25519::PublicKey::from_bytes(&self.account).map_err(|_| Failure::Signature)?;
+        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
+            true => Ok(()),
+            false => Err(Failure::Signature),
+        }
     }
 }
 impl<'a> RaiHashImpl<'a> for OpenTransaction {
@@ -285,14 +308,13 @@ impl SendTransaction {
         self.verify_balance(storage, pubkey)
     }
     fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
-        let pubkey = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        signature::verify(
-            &ED25519,
-            Input::from(&pubkey),
-            Input::from(&self.hash()),
-            Input::from(&self.signature),
-        ).map_err(|_| Failure::Signature)?;
-        Ok(pubkey)
+        let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
+        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
+        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
+            true => Ok(pubkey_bytes),
+            false => Err(Failure::Signature),
+        }
     }
     fn verify_balance<S: BlockStorage>(
         &self,
@@ -359,14 +381,13 @@ impl ReceiveTransaction {
         }
     }
     fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
-        let pubkey = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        signature::verify(
-            &ED25519,
-            Input::from(&pubkey),
-            Input::from(&self.hash()),
-            Input::from(&self.signature),
-        ).map_err(|_| Failure::Signature)?;
-        Ok(pubkey)
+        let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
+        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
+        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
+            true => Ok(pubkey_bytes),
+            false => Err(Failure::Signature),
+        }
     }
 }
 
@@ -399,13 +420,13 @@ impl ChangeTransaction {
         self.verify_work()
     }
     fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
-        let pubkey = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        signature::verify(
-            &ED25519,
-            Input::from(&pubkey),
-            Input::from(&self.hash()),
-            Input::from(&self.signature),
-        ).map_err(|_| Failure::Signature)
+        let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
+        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
+        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
+            true => Ok(()),
+            false => Err(Failure::Signature),
+        }
     }
 }
 
@@ -593,6 +614,7 @@ impl BlockStorage for Storage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     /// The transaction is already recorded
     Duplicate,
