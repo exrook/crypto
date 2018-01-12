@@ -1,16 +1,18 @@
+use std::convert::TryInto;
 use ed25519_dalek as ed25519;
 use blake2::Blake2b;
-use digest::{Input, VariableOutput};
+use blake2::digest::{Input, VariableOutput};
 
 use types::{Balance, Hash, PubKey, Signature, Work, WorkHash};
 use errors::Failure;
 use blockstorage::BlockStorage;
+use work::compute_work;
 
 pub trait RaiHash {
     fn hash(&self) -> Hash;
 }
 
-trait RaiHashImpl<'a> {
+pub trait RaiHashImpl<'a> {
     type Elements: AsRef<[&'a [u8]]>;
     #[inline]
     fn hash_elements(&'a self) -> Self::Elements;
@@ -45,7 +47,7 @@ pub trait RaiWork {
     fn work_calculate(&self, Work) -> WorkHash;
 }
 
-trait RaiWorkImpl {
+pub trait RaiWorkImpl {
     fn work_element(&self) -> &[u8];
     fn work_value(&self) -> Work;
     fn work_impl(&self, work: Work) -> WorkHash {
@@ -67,6 +69,7 @@ impl<T: RaiWorkImpl> RaiWork for T {
     }
 }
 
+#[derive(Debug)]
 pub enum Transaction {
     Open(OpenTransaction),
     Send(SendTransaction),
@@ -99,6 +102,7 @@ impl RaiHash for Transaction {
     }
 }
 
+#[derive(Debug)]
 pub struct OpenTransaction {
     pub account: PubKey,
     pub source: Hash,
@@ -108,26 +112,47 @@ pub struct OpenTransaction {
 }
 
 impl OpenTransaction {
-    fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+    pub fn new(key: &ed25519::Keypair, source: Hash, rep: Option<PubKey>) -> Self {
+        let mut o = Self::new_without_work(key, source, rep);
+        o.work = compute_work(&o);
+        o
+    }
+    pub fn new_without_work(key: &ed25519::Keypair, source: Hash, rep: Option<PubKey>) -> Self {
+        let mut o = Self {
+            account: key.public.to_bytes().into(),
+            source,
+            representative: rep.unwrap_or(key.public.to_bytes().into()),
+            work: Work::default(),
+            signature: Signature::default(),
+        };
+        o.signature = key.sign::<Blake2b>(&o.hash()).to_bytes().into();
+        o
+    }
+    pub fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
         self.verify_sig()?;
         self.verify_work()?;
         self.verify_parent(storage)
     }
-    fn verify_parent<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
-        let source = storage.lookup(self.source).ok_or(Failure::Missing)?;
-        let source = match source {
-            &Transaction::Send(ref s) => s,
-            _ => return Err(Failure::Invalid),
-        };
-        if source.destination != self.account {
-            Err(Failure::Invalid)
-        } else {
+    pub(crate) fn verify_parent<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+        {
+            let source = storage.lookup(self.source).ok_or(Failure::Missing)?;
+            let source = match source {
+                &Transaction::Send(ref s) => s,
+                _ => return Err(Failure::Invalid),
+            };
+            if source.destination != self.account {
+                return Err(Failure::Invalid);
+            }
+        }
+        if storage.is_unspent(self.source) {
             Ok(())
+        } else {
+            Err(Failure::Received)
         }
     }
-    fn verify_sig(&self) -> Result<(), Failure> {
-        let pubkey = ed25519::PublicKey::from_bytes(&self.account).map_err(|_| Failure::Signature)?;
-        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+    pub(crate) fn verify_sig(&self) -> Result<(), Failure> {
+        let pubkey: ed25519::PublicKey = self.account.try_into()?;
+        let sig = self.signature.try_into()?;
         match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
             true => Ok(()),
             false => Err(Failure::Signature),
@@ -137,19 +162,30 @@ impl OpenTransaction {
 impl<'a> RaiHashImpl<'a> for OpenTransaction {
     type Elements = [&'a [u8]; 3];
     fn hash_elements(&'a self) -> [&'a [u8]; 3] {
-        [&self.source, &self.representative, &self.account]
+        [
+            &self.source,
+            self.representative.as_ref(),
+            self.account.as_ref(),
+        ]
     }
 }
 
 impl RaiWorkImpl for OpenTransaction {
     fn work_element(&self) -> &[u8] {
-        &self.account
+        self.account.as_ref()
     }
     fn work_value(&self) -> Work {
         self.work
     }
 }
 
+impl Into<Transaction> for OpenTransaction {
+    fn into(self) -> Transaction {
+        Transaction::Open(self)
+    }
+}
+
+#[derive(Debug)]
 pub struct SendTransaction {
     pub previous: Hash,
     pub balance: Balance,
@@ -159,26 +195,50 @@ pub struct SendTransaction {
 }
 
 impl SendTransaction {
-    fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+    pub fn new(
+        key: &ed25519::Keypair,
+        previous: Hash,
+        balance: Balance,
+        destination: PubKey,
+    ) -> Self {
+        let mut o = Self::new_without_work(key, previous, balance, destination);
+        o.work = compute_work(&o);
+        o
+    }
+    pub fn new_without_work(
+        key: &ed25519::Keypair,
+        previous: Hash,
+        balance: Balance,
+        destination: PubKey,
+    ) -> Self {
+        let mut o = Self {
+            previous,
+            balance,
+            destination,
+            work: Work::default(),
+            signature: Signature::default(),
+        };
+        o.signature = key.sign::<Blake2b>(&o.hash()).into();
+        o
+    }
+    pub(crate) fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
         self.verify_work()?;
         let pubkey = self.verify_sig(storage)?;
-        self.verify_balance(storage, pubkey)
+        self.verify_balance(storage)
     }
-    fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
+    pub(crate) fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
         let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
-        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        let pubkey: ed25519::PublicKey = pubkey_bytes.try_into()?;
+        let sig = self.signature.try_into()?;
         match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
             true => Ok(pubkey_bytes),
             false => Err(Failure::Signature),
         }
     }
-    fn verify_balance<S: BlockStorage>(
-        &self,
-        storage: &mut S,
-        pubkey: PubKey,
-    ) -> Result<(), Failure> {
-        let bal = storage.find_balance(pubkey).ok_or(Failure::Unreachable)?;
+    pub(crate) fn verify_balance<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+        let bal = storage
+            .find_balance(self.previous)
+            .ok_or(Failure::Unreachable)?;
         if self.balance > bal {
             Err(Failure::OverSend)
         } else {
@@ -190,7 +250,11 @@ impl SendTransaction {
 impl<'a> RaiHashImpl<'a> for SendTransaction {
     type Elements = [&'a [u8]; 3];
     fn hash_elements(&'a self) -> [&'a [u8]; 3] {
-        [&self.previous, &self.destination, self.balance.as_ref()]
+        [
+            &self.previous,
+            self.destination.as_ref(),
+            self.balance.as_ref(),
+        ]
     }
 }
 
@@ -203,6 +267,13 @@ impl RaiWorkImpl for SendTransaction {
     }
 }
 
+impl Into<Transaction> for SendTransaction {
+    fn into(self) -> Transaction {
+        Transaction::Send(self)
+    }
+}
+
+#[derive(Debug)]
 pub struct ReceiveTransaction {
     pub previous: Hash,
     pub source: Hash,
@@ -211,12 +282,27 @@ pub struct ReceiveTransaction {
 }
 
 impl ReceiveTransaction {
-    fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+    pub fn new(key: &ed25519::Keypair, previous: Hash, source: Hash) -> Self {
+        let mut o = Self::new_without_work(key, previous, source);
+        o.work = compute_work(&o);
+        o
+    }
+    pub fn new_without_work(key: &ed25519::Keypair, previous: Hash, source: Hash) -> Self {
+        let mut o = Self {
+            previous,
+            source,
+            work: Work::default(),
+            signature: Signature::default(),
+        };
+        o.signature = key.sign::<Blake2b>(&o.hash()).into();
+        o
+    }
+    pub(crate) fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
         self.verify_work()?;
         let pubkey = self.verify_sig(storage)?;
         self.verify_parent(storage, pubkey)
     }
-    fn verify_parent<S: BlockStorage>(
+    pub(crate) fn verify_parent<S: BlockStorage>(
         &self,
         storage: &mut S,
         pubkey: PubKey,
@@ -237,10 +323,10 @@ impl ReceiveTransaction {
             Err(Failure::Received)
         }
     }
-    fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
+    pub(crate) fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<PubKey, Failure> {
         let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
-        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        let pubkey: ed25519::PublicKey = pubkey_bytes.try_into()?;
+        let sig = self.signature.try_into()?;
         match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
             true => Ok(pubkey_bytes),
             false => Err(Failure::Signature),
@@ -264,6 +350,13 @@ impl RaiWorkImpl for ReceiveTransaction {
     }
 }
 
+impl Into<Transaction> for ReceiveTransaction {
+    fn into(self) -> Transaction {
+        Transaction::Receive(self)
+    }
+}
+
+#[derive(Debug)]
 pub struct ChangeTransaction {
     pub previous: Hash,
     pub representative: PubKey,
@@ -272,14 +365,29 @@ pub struct ChangeTransaction {
 }
 
 impl ChangeTransaction {
-    fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+    pub fn new(key: &ed25519::Keypair, previous: Hash, rep: PubKey) -> Self {
+        let mut o = Self::new_without_work(key, previous, rep);
+        o.work = compute_work(&o);
+        o
+    }
+    pub fn new_without_work(key: &ed25519::Keypair, previous: Hash, rep: PubKey) -> Self {
+        let mut o = Self {
+            previous,
+            representative: rep,
+            work: Work::default(),
+            signature: Signature::default(),
+        };
+        o.signature = key.sign::<Blake2b>(&o.hash()).into();
+        o
+    }
+    pub(crate) fn verify<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
         self.verify_sig(storage)?;
         self.verify_work()
     }
-    fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
+    pub(crate) fn verify_sig<S: BlockStorage>(&self, storage: &mut S) -> Result<(), Failure> {
         let pubkey_bytes = storage.find_key(self.previous).ok_or(Failure::Missing)?;
-        let pubkey = ed25519::PublicKey::from_bytes(&pubkey_bytes).map_err(|_| Failure::Signature)?;
-        let sig = ed25519::Signature::from_bytes(&self.signature).map_err(|_| Failure::Signature)?;
+        let pubkey: ed25519::PublicKey = pubkey_bytes.try_into()?;
+        let sig = self.signature.try_into()?;
         match pubkey.verify::<Blake2b>(&self.hash(), &sig) {
             true => Ok(()),
             false => Err(Failure::Signature),
@@ -290,7 +398,7 @@ impl ChangeTransaction {
 impl<'a> RaiHashImpl<'a> for ChangeTransaction {
     type Elements = [&'a [u8]; 2];
     fn hash_elements(&'a self) -> [&'a [u8]; 2] {
-        [&self.previous, &self.representative]
+        [&self.previous, self.representative.as_ref()]
     }
 }
 
@@ -300,5 +408,11 @@ impl RaiWorkImpl for ChangeTransaction {
     }
     fn work_value(&self) -> Work {
         self.work
+    }
+}
+
+impl Into<Transaction> for ChangeTransaction {
+    fn into(self) -> Transaction {
+        Transaction::Change(self)
     }
 }

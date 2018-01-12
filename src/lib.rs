@@ -1,16 +1,16 @@
-#![feature(i128_type, never_type)]
+#![feature(i128_type, never_type, try_from)]
 extern crate blake2;
 extern crate byteorder;
 extern crate ed25519_dalek;
+extern crate rand;
 
-use ed25519_dalek as ed25519;
-use blake2::{digest, Blake2b};
-use digest::{Input, VariableOutput};
-
+#[cfg(test)]
+mod tests;
 mod genesis;
 mod transaction;
 mod types;
 mod blockstorage;
+mod work;
 mod errors {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Failure {

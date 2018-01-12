@@ -45,32 +45,9 @@ pub trait BlockStorage {
 
     /// Try to insert a new transaction
     fn insert(&mut self, tx: Transaction) -> Result<(), Failure>;
-    //fn calculate_balance(&mut self, mut hash: Hash) -> Option<u128> {
-    //    let mut bal = 0;
-    //    loop {
-    //        let (next, leaf) = match self.lookup(next) {
-    //            Some(&Transaction::Open(ref o)) => (None, o.source),
-    //            Some(&Transaction::Receive(ref r)) => (Some(r.previous), r.source),
-    //            Some(&Transaction::Send(ref s)) => {
-    //                bal += s.balance;
-    //                return Some(bal);
-    //            }
-    //            Some(&Transaction::Change(ref c)) => {}
-    //            None => return None,
-    //        };
-    //        match self.lookup(leaf) {
-    //            Some(&Transaction::Send(ref s)) => bal,
-    //            _ => unreachable!(),
-    //        }
-    //        if let Some(next) = next {
-    //            hash = next;
-    //        } else {
-    //            return Some(balance);
-    //        }
-    //    }
-    //}
 }
 
+#[derive(Debug)]
 pub struct Storage {
     transactions: HashMap<Hash, (Transaction, Balance)>,
     heads: HashMap<PubKey, Hash>,
@@ -94,7 +71,7 @@ impl Storage {
             unspent,
         }
     }
-    fn new_test() -> Self {
+    pub(crate) fn new_test() -> Self {
         let mut transactions = HashMap::new();
         let mut heads = HashMap::new();
         let unspent = HashSet::new();
@@ -167,8 +144,20 @@ impl BlockStorage for Storage {
             return Err(Failure::Fork);
         }
         let hash = tx.hash();
+        match tx {
+            Send(_) => {
+                self.unspent.insert(hash);
+            }
+            Open(ref o) => {
+                self.unspent.remove(&o.source);
+            }
+            Receive(ref r) => {
+                self.unspent.remove(&r.source);
+            }
+            _ => {}
+        };
         self.transactions.insert(hash, (tx, bal));
         self.heads.insert(key, hash);
-        panic!()
+        Ok(())
     }
 }
