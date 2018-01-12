@@ -17,12 +17,12 @@ pub trait RaiHashImpl<'a> {
     #[inline]
     fn hash_elements(&'a self) -> Self::Elements;
     fn hash_impl(&'a self) -> Hash {
-        let mut hash = Blake2b::new(32).unwrap();
+        let mut hash = Blake2b::new(32).expect("Unreachable");
         for e in self.hash_elements().as_ref() {
             hash.process(e)
         }
         let mut bytes = Hash::default();
-        hash.variable_result(&mut bytes).unwrap();
+        hash.variable_result(&mut bytes).expect("Unreachable");
         bytes
     }
 }
@@ -51,11 +51,11 @@ pub trait RaiWorkImpl {
     fn work_element(&self) -> &[u8];
     fn work_value(&self) -> Work;
     fn work_impl(&self, work: Work) -> WorkHash {
-        let mut hash = Blake2b::new(8).unwrap();
+        let mut hash = Blake2b::new(8).expect("Unreachable");
         hash.process(work.as_ref());
         hash.process(self.work_element());
         let mut bytes = <[u8; 8]>::default();
-        hash.variable_result(&mut bytes).unwrap();
+        hash.variable_result(&mut bytes).expect("Unreachable");
         WorkHash(bytes)
     }
 }

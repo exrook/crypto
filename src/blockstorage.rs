@@ -33,7 +33,7 @@ pub trait BlockStorage {
             }
         }
         // This is a hack to get around the borrow checker
-        match self.lookup(hash).unwrap() {
+        match self.lookup(hash).expect("Unreachable") {
             &Transaction::Open(ref t) => Some(t),
             _ => unreachable!(),
         }
